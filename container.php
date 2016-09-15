@@ -10,7 +10,12 @@ use Bernard\Queue;
 use Bernard\QueueFactory;
 use Bernard\QueueFactory\PersistentFactory;
 use Building\Domain\Aggregate\Building;
+use Building\Domain\Authorization\AuthorizedUsersInterface;
 use Building\Domain\Command;
+use Building\Domain\DomainEvent\UserCheckedMultipleTimesIntoBuilding;
+use Building\Domain\DomainEvent\UserWasCheckedIntoBuilding;
+use Building\Domain\DomainEvent\UserWasCheckedOutOfBuilding;
+use Building\Domain\ProcessManager\NotifyAdministratorWhenUserCheckedInMultipleTimes;
 use Building\Domain\Repository\BuildingRepositoryInterface;
 use Building\Infrastructure\Repository\BuildingRepository;
 use Doctrine\DBAL\Connection;
@@ -137,7 +142,7 @@ return new ServiceManager([
             return $eventStore;
         },
 
-        CommandBus::class                  => function (ContainerInterface $container) : CommandBus {
+        'immediate-command-bus'                  => function (ContainerInterface $container) : CommandBus {
             $commandBus = new CommandBus();
 
             $commandBus->utilize(new ServiceLocatorPlugin($container));
@@ -169,6 +174,26 @@ return new ServiceManager([
             return $commandBus;
         },
 
+        CommandBus::class => function (ContainerInterface $container) : CommandBus {
+            return new class ($container->get(MessageProducer::class)) extends CommandBus
+            {
+                /**
+                 * @var MessageProducer
+                 */
+                private $messageProducer;
+
+                public function __construct(MessageProducer $messageProducer)
+                {
+                    $this->messageProducer = $messageProducer;
+                }
+
+                public function dispatch($command)
+                {
+                    $this->messageProducer->__invoke($command);
+                }
+            };
+        },
+
         // ignore this - this is async stuff
         // we'll get to it later
 
@@ -198,6 +223,128 @@ return new ServiceManager([
             return function (Command\RegisterNewBuilding $command) use ($buildings) {
                 $buildings->add(Building::new($command->name()));
             };
+        },
+        Command\CheckUserIntoBuilding::class => function (ContainerInterface $container) : callable {
+            $buildings = $container->get(BuildingRepositoryInterface::class);
+
+            return function (Command\CheckUserIntoBuilding $command) use ($buildings) {
+                $building = $buildings->get($command->building());
+
+                $building->checkInUser(
+                    new class implements AuthorizedUsersInterface {
+                        public function has(string $username) : bool {
+                            return in_array($username, ['fritz', 'franz', 'otto'], true);
+                        }
+                    },
+                    $command->username()
+                );
+
+                $buildings->add($building);
+            };
+        },
+        Command\CheckUserOutOfBuilding::class => function (ContainerInterface $container) : callable {
+            $buildings = $container->get(BuildingRepositoryInterface::class);
+
+            return function (Command\CheckUserOutOfBuilding $command) use ($buildings) {
+                $building = $buildings->get($command->building());
+
+                $building->checkOutUser($command->username());
+
+                $buildings->add($building);
+            };
+        },
+        Command\NotifyAdministratorOfMultipleCheckInAnomaly::class => function (ContainerInterface $container) : callable {
+            return function (Command\NotifyAdministratorOfMultipleCheckInAnomaly $command) {
+                error_log(sprintf(
+                    'User "%s" is cheating the system at building "%s"',
+                    $command->username(),
+                    $command->building()->toString()
+                ));
+            };
+        },
+        'refresh-current-users-in-building-json' => function (ContainerInterface $container) : callable {
+            $connection = $container->get(Connection::class);
+
+            return function () use ($connection) {
+                $relevantEvents = $connection
+                    ->executeQuery(
+                        'SELECT aggregate_id, payload, event_name FROM event_stream WHERE event_name IN (:eventNames) ORDER BY aggregate_id ASC, version ASC',
+                        ['eventNames' => [UserWasCheckedIntoBuilding::class, UserWasCheckedOutOfBuilding::class]],
+                        ['eventNames' => Connection::PARAM_STR_ARRAY]
+                    );
+
+                $lastAggregate = null;
+
+                while ($row = $relevantEvents->fetch(\PDO::FETCH_ASSOC)) {
+                    $path = __DIR__ . '/public/proper-' . $row['aggregate_id'] . '.json';
+
+                    if ($lastAggregate !== $row['aggregate_id']) {
+                        @unlink($path);
+                        $lastAggregate = $row['aggregate_id'];
+                    }
+
+                    $usernames = [];
+
+                    if (file_exists($path)) {
+                        $usernames = array_map('strval', json_decode(file_get_contents($path), true));
+                    }
+
+                    $username = json_decode($row['payload'], true)['username'];
+
+                    $allUsernames = array_values(array_unique(array_merge($usernames, [$username])));
+
+                    if ($row['event_name'] === UserWasCheckedOutOfBuilding::class) {
+                        $usernamesIndexedByUsername = array_flip($allUsernames);
+
+                        unset($usernamesIndexedByUsername[$username]);
+
+                        $allUsernames = array_values(array_flip($usernamesIndexedByUsername));
+                    }
+
+                    file_put_contents($path, json_encode($allUsernames));
+                }
+            };
+        },
+        UserWasCheckedIntoBuilding::class . '-projectors' => function (ContainerInterface $container) : array {
+            return [
+                function (UserWasCheckedIntoBuilding $event) {
+                    $path = __DIR__ . '/public/' . $event->aggregateId() . '.json';
+
+                    $usernames = [];
+
+                    if (file_exists($path)) {
+                        $usernames = array_map('strval', json_decode(file_get_contents($path), true));
+                    }
+
+                    file_put_contents($path, json_encode(array_values(array_unique(array_merge($usernames, [$event->username()])))));
+                },
+                $container->get('refresh-current-users-in-building-json'),
+            ];
+        },
+        UserWasCheckedOutOfBuilding::class . '-projectors' => function (ContainerInterface $container) : array {
+            return [
+                function (UserWasCheckedOutOfBuilding $event) {
+                    $path = __DIR__ . '/public/' . $event->aggregateId() . '.json';
+
+                    $usernames = [];
+
+                    if (file_exists($path)) {
+                        $usernames = array_map('strval', json_decode(file_get_contents($path), true));
+                    }
+
+                    $usernamesIndexedByUsername = array_flip($usernames);
+
+                    unset($usernamesIndexedByUsername[$event->username()]);
+
+                    file_put_contents($path, json_encode(array_values(array_flip($usernamesIndexedByUsername))));
+                },
+                $container->get('refresh-current-users-in-building-json'),
+            ];
+        },
+        UserCheckedMultipleTimesIntoBuilding::class . '-listeners' => function (ContainerInterface $container) : array {
+            return [
+                new NotifyAdministratorWhenUserCheckedInMultipleTimes([$container->get(CommandBus::class), 'dispatch']),
+            ];
         },
         BuildingRepositoryInterface::class => function (ContainerInterface $container) : BuildingRepositoryInterface {
             return new BuildingRepository(
